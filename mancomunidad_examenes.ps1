@@ -29,7 +29,7 @@ Write-Host "  =============================================" -ForegroundColor Cy
 Write-Host ""
 
 $pasoActual = 0
-$pasoTotal = 5
+$pasoTotal = 4
 
 function Write-Paso {
     param([string]$Titulo)
@@ -102,65 +102,7 @@ else {
 }
 
 # =============================================================================
-# PASO 2: Instalar LibreOffice via winget
-# =============================================================================
-Write-Paso "INSTALAR LIBREOFFICE"
-
-$tieneWinget = Get-Command winget -ErrorAction SilentlyContinue
-
-if (-not $tieneWinget) {
-    Write-Host "  [!!] winget no encontrado. Intentando instalar..." -ForegroundColor Yellow
-    try {
-        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        $tieneWinget = Get-Command winget -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Host "  [!!] No se pudo instalar winget automaticamente" -ForegroundColor Red
-    }
-}
-
-if ($tieneWinget) {
-    # Verificar si ya esta instalado (winget O en disco)
-    $loInstalled = $false
-    $loWinget = winget list --id TheDocumentFoundation.LibreOffice 2>$null | Select-String "TheDocumentFoundation"
-    if ($loWinget) { $loInstalled = $true }
-
-    # Buscar tambien en disco (instalacion manual)
-    if (-not $loInstalled) {
-        $loPaths = @(
-            "${env:ProgramFiles}\LibreOffice",
-            "${env:ProgramFiles(x86)}\LibreOffice",
-            "C:\Program Files\LibreOffice",
-            "C:\Program Files (x86)\LibreOffice"
-        )
-        foreach ($p in $loPaths) {
-            if (Test-Path $p) { $loInstalled = $true; break }
-        }
-    }
-
-    if ($loInstalled) {
-        Write-Host "  [OK] LibreOffice ya esta instalado - omitiendo" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  Instalando LibreOffice (esto tarda unos minutos)..." -ForegroundColor White
-        winget install --id TheDocumentFoundation.LibreOffice --accept-package-agreements --accept-source-agreements --silent
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  [OK] LibreOffice instalado correctamente" -ForegroundColor Green
-        }
-        else {
-            Write-Host "  [!!] Error al instalar LibreOffice (codigo: $LASTEXITCODE)" -ForegroundColor Red
-            Write-Host "  [ii] Puedes instalarlo manualmente desde: https://es.libreoffice.org/descarga/" -ForegroundColor Yellow
-        }
-    }
-}
-else {
-    Write-Host "  [!!] winget no disponible. Instala LibreOffice manualmente." -ForegroundColor Red
-    Write-Host "  [ii] Descarga: https://es.libreoffice.org/descarga/" -ForegroundColor Yellow
-}
-
-# =============================================================================
-# PASO 3: Tweaks de rendimiento y apariencia (HKLM - aplican a todos)
+# PASO 2: Tweaks de rendimiento y apariencia (HKLM - aplican a todos)
 # =============================================================================
 Write-Paso "TWEAKS DEL SISTEMA (todos los usuarios)"
 
@@ -404,7 +346,6 @@ Write-Paso "RESUMEN"
 Write-Host ""
 Write-Host "  Usuario:       $NombreUsuario (admin)" -ForegroundColor White
 Write-Host "  Password:      (sin password)" -ForegroundColor White
-Write-Host "  LibreOffice:   Instalado via winget" -ForegroundColor White
 Write-Host "  Tweaks:        Rendimiento + privacidad + apariencia" -ForegroundColor White
 Write-Host "  Bloatware:     Removido" -ForegroundColor White
 Write-Host "  Energia:       Alto rendimiento (sin suspension)" -ForegroundColor White
