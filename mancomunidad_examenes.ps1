@@ -82,7 +82,7 @@ else {
     Write-Host "  Creando usuario '$NombreUsuario'..." -ForegroundColor White
 
     try {
-        New-LocalUser -Name $NombreUsuario -NoPassword -FullName "Usuario Examenes" -Description "Cuenta para examenes" -ErrorAction Stop
+        New-LocalUser -Name $NombreUsuario -NoPassword -FullName $NombreUsuario -Description "Cuenta para examenes" -UserMayNotChangePassword -ErrorAction Stop
         Write-Host "  [OK] Usuario creado (sin password)" -ForegroundColor Green
 
         # Anadir a administradores (intentar en espanol y en ingles)
