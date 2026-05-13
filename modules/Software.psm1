@@ -1,0 +1,701 @@
+# Software.psm1 - Modulo de instalacion de software via winget
+# Funciones para catalogo, verificacion, instalacion y flujo interactivo
+
+function Get-SoftwareCatalog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    try {
+        if (-not (Test-Path $ConfigPath)) {
+            Write-Log -Message "Archivo de catalogo no encontrado: $ConfigPath" -Level Error
+            return $null
+        }
+
+        $content = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+        $catalog = $content | ConvertFrom-Json
+
+        if (-not $catalog.categories) {
+            Write-Log -Message "El catalogo no contiene categorias validas" -Level Error
+            return $null
+        }
+
+        $totalPackages = 0
+        foreach ($cat in $catalog.categories) {
+            $totalPackages += $cat.packages.Count
+        }
+
+        Write-Log -Message "Catalogo cargado: $($catalog.categories.Count) categorias, $totalPackages paquetes" -Level Success
+        return $catalog
+    }
+    catch {
+        Write-Log -Message "Error al leer el catalogo de software: $_" -Level Error
+        return $null
+    }
+}
+
+function Test-SoftwareInstalled {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageId,
+
+        [Parameter()]
+        [string]$PackageName = ""
+    )
+
+    # Check 1: buscar por ID en winget
+    try {
+        $output = & winget list --id $PackageId --accept-source-agreements 2>&1
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0 -and ($output | Out-String) -match $PackageId) {
+            return $true
+        }
+    }
+    catch {}
+
+    # Check 2: buscar por nombre (para paquetes instalados manualmente o con IDs no-winget)
+    if ($PackageName) {
+        try {
+            $output = & winget list --name "$PackageName" --accept-source-agreements 2>&1
+            $exitCode = $LASTEXITCODE
+            $outputText = $output | Out-String
+
+            if ($exitCode -eq 0 -and $outputText -match [regex]::Escape($PackageName)) {
+                return $true
+            }
+        }
+        catch {}
+    }
+
+    return $false
+}
+
+function Install-ManualPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ManualUrl,
+
+        [Parameter()]
+        [string]$ManualNote = "",
+
+        [Parameter()]
+        [string]$SilentArgs = ""
+    )
+
+    Write-Log -Message "Descarga directa: $PackageName" -Level Info
+
+    # Descargar a C:\instaladores\ para que el usuario siempre tenga los instaladores
+    $downloadDir = 'C:\instaladores'
+    if (-not (Test-Path $downloadDir)) { New-Item -Path $downloadDir -ItemType Directory -Force | Out-Null }
+    $tempDir = $downloadDir
+
+    $installSuccess = $false
+
+    try {
+        # Extraer nombre de archivo limpio (sin query strings)
+        $uri = [System.Uri]$ManualUrl
+        $fileName = [System.IO.Path]::GetFileName($uri.LocalPath)
+        $usedFallbackName = $false
+        if (-not $fileName -or $fileName -eq '/' -or -not [System.IO.Path]::HasExtension($fileName)) {
+            # NO poner extension - dejar que Content-Disposition o Content-Type la determinen
+            $fileName = "$($PackageName -replace '[^a-zA-Z0-9]', '_')_installer"
+            $usedFallbackName = $true
+        }
+        $downloadPath = Join-Path $tempDir $fileName
+
+        # --- DESCARGA ---
+        Write-Log -Message "Descargando $PackageName..." -Level Info
+        $ProgressPreference = 'SilentlyContinue'
+        $response = $null
+
+        # Usar WebClient para archivos grandes (IMG/ISO) - Invoke-WebRequest falla con "secuencia demasiado larga"
+        if ($fileName -match '\.(img|iso)$') {
+            Write-Log -Message "Archivo grande detectado, usando WebClient..." -Level Info
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $webClient = New-Object System.Net.WebClient
+            try {
+                $webClient.DownloadFile($ManualUrl, $downloadPath)
+            }
+            finally {
+                $webClient.Dispose()
+            }
+        }
+        else {
+            $response = Invoke-WebRequest -Uri $ManualUrl -OutFile $downloadPath -UseBasicParsing -ErrorAction Stop -PassThru
+        }
+
+        # Verificar que el archivo se descargo
+        if (-not (Test-Path $downloadPath) -or (Get-Item $downloadPath).Length -eq 0) {
+            Write-Log -Message "El archivo descargado esta vacio o no existe" -Level Error
+            throw "Descarga fallida: archivo vacio"
+        }
+
+        # Detectar nombre real desde Content-Disposition (ej: API Adoptium devuelve el .msi real)
+        $realNameDetected = $false
+        if ($response -and $response.Headers.'Content-Disposition') {
+            $disposition = $response.Headers.'Content-Disposition'
+            if ($disposition -match 'filename[^;=\n]*=\s*"?([^";\n]+)') {
+                $realFileName = $Matches[1].Trim()
+                if ($realFileName -and [System.IO.Path]::HasExtension($realFileName)) {
+                    $newPath = Join-Path $tempDir $realFileName
+                    if ($newPath -ne $downloadPath) {
+                        Move-Item -Path $downloadPath -Destination $newPath -Force
+                        $downloadPath = $newPath
+                        $fileName = $realFileName
+                        $realNameDetected = $true
+                        Write-Log -Message "Nombre real detectado (Content-Disposition): $fileName" -Level Info
+                    }
+                }
+            }
+        }
+
+        # Detectar tipo real desde Content-Type si aun no tiene extension clara
+        if (-not $realNameDetected -and $fileName -notmatch '\.(msi|exe|zip|img|msix)$') {
+            $contentType = if ($response -and $response.Headers.'Content-Type') { $response.Headers.'Content-Type' } else { '' }
+            $detectedExt = $null
+            if ($contentType -match 'msi|x-msi') { $detectedExt = '.msi' }
+            elseif ($contentType -match 'zip|x-zip') { $detectedExt = '.zip' }
+            elseif ($contentType -match 'octet-stream' -or -not $detectedExt) {
+                # Leer magic bytes del archivo para detectar tipo real
+                $bytes = [System.IO.File]::ReadAllBytes($downloadPath)[0..3]
+                if ($bytes.Count -ge 4) {
+                    # MSI magic: D0 CF 11 E0 (OLE Compound Document)
+                    if ($bytes[0] -eq 0xD0 -and $bytes[1] -eq 0xCF -and $bytes[2] -eq 0x11 -and $bytes[3] -eq 0xE0) { $detectedExt = '.msi' }
+                    # ZIP magic: 50 4B 03 04
+                    elseif ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and $bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) { $detectedExt = '.zip' }
+                    # EXE/DLL magic: 4D 5A (MZ)
+                    elseif ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) { $detectedExt = '.exe' }
+                }
+            }
+
+            if ($detectedExt) {
+                $fileName = $fileName -replace '\.[^.]*$', ''
+                $fileName += $detectedExt
+                $newPath = Join-Path $tempDir $fileName
+                if ($newPath -ne $downloadPath) {
+                    Move-Item -Path $downloadPath -Destination $newPath -Force
+                    $downloadPath = $newPath
+                    Write-Log -Message "Tipo detectado: $fileName ($detectedExt)" -Level Info
+                }
+            }
+            elseif ($usedFallbackName) {
+                # Ultimo recurso: asumir .exe
+                $fileName += '.exe'
+                $newPath = Join-Path $tempDir $fileName
+                Move-Item -Path $downloadPath -Destination $newPath -Force
+                $downloadPath = $newPath
+            }
+        }
+
+        $fileSize = [math]::Round((Get-Item $downloadPath).Length / 1MB, 1)
+        Write-Log -Message "Descarga completada: $fileName ($fileSize MB)" -Level Success
+
+        # --- INSTALACION ---
+        if ($fileName -match '\.zip$') {
+            # ZIP: extraer y buscar instalador
+            try {
+                Write-Log -Message "Extrayendo $fileName..." -Level Info
+                $extractDir = Join-Path $tempDir 'extracted'
+                Expand-Archive -Path $downloadPath -DestinationPath $extractDir -Force -ErrorAction Stop
+
+                # Priorizar: 1) MSI, 2) setup.exe/install.exe, 3) otros EXE (excluir utilidades)
+                $allFiles = Get-ChildItem -Path $extractDir -Recurse -Include '*.exe','*.msi' |
+                    Where-Object { $_.Name -notmatch 'unins|jabswitch|javaws|jjs|keytool|kinit|klist|ktab|orbd|pack200|policytool|rmid|rmiregistry|servertool|tnameserv' }
+                $installer = $allFiles | Where-Object { $_.Extension -eq '.msi' } | Select-Object -First 1
+                if (-not $installer) {
+                    $installer = $allFiles | Where-Object { $_.Name -match '^(setup|install|Setup|Install)' } | Select-Object -First 1
+                }
+                if (-not $installer) {
+                    $installer = $allFiles | Select-Object -First 1
+                }
+
+                if ($installer) {
+                    Write-Log -Message "Instalador encontrado: $($installer.Name)" -Level Info
+                    if ($installer.Extension -eq '.msi') {
+                        $proc = Start-Process -FilePath 'msiexec' -ArgumentList "/i `"$($installer.FullName)`" /passive /norestart" -Wait -PassThru -ErrorAction Stop
+                    }
+                    else {
+                        $proc = Start-Process -FilePath $installer.FullName -ArgumentList '/S','/silent','/VERYSILENT' -Wait -PassThru -ErrorAction SilentlyContinue
+                        if (-not $proc -or $proc.ExitCode -ne 0) {
+                            $proc = Start-Process -FilePath $installer.FullName -Wait -PassThru -ErrorAction Stop
+                        }
+                    }
+                    if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                        Write-Log -Message "$PackageName instalado correctamente (codigo: $($proc.ExitCode))" -Level Success
+                        $installSuccess = $true
+                    }
+                    else {
+                        Write-Log -Message "$PackageName finalizo con codigo: $($proc.ExitCode)" -Level Warning
+                        $installSuccess = $true  # Muchos instaladores usan codigos no-estandar pero instalan bien
+                    }
+                }
+                else {
+                    Write-Log -Message "No se encontro instalador en el ZIP" -Level Error
+                }
+            }
+            catch {
+                Write-Log -Message "Error al extraer/instalar desde ZIP: $_" -Level Error
+            }
+        }
+        elseif ($fileName -match '\.exe$') {
+            # EXE: ejecutar instalador
+            try {
+                Write-Log -Message "Ejecutando instalador: $fileName" -Level Info
+                # Usar argumentos personalizados si se proporcionaron, sino los genericos
+                if ($SilentArgs) {
+                    Write-Log -Message "  Usando argumentos personalizados: $SilentArgs" -Level Info
+                    $proc = Start-Process -FilePath $downloadPath -ArgumentList $SilentArgs -Wait -PassThru -ErrorAction SilentlyContinue
+                }
+                else {
+                    $proc = Start-Process -FilePath $downloadPath -ArgumentList '/S','/silent','/VERYSILENT' -Wait -PassThru -ErrorAction SilentlyContinue
+                }
+                if ($proc -and ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010)) {
+                    Write-Log -Message "$PackageName instalado correctamente (codigo: $($proc.ExitCode))" -Level Success
+                    $installSuccess = $true
+                }
+                elseif ($proc) {
+                    # Silencioso fallo pero termino - avisar al usuario en vez de abrir interactivo
+                    Write-Log -Message "${PackageName}: instalacion silenciosa fallo (codigo: $($proc.ExitCode))" -Level Warning
+                    Write-Host "" -ForegroundColor Yellow
+                    Write-Host "  ============================================" -ForegroundColor Yellow
+                    Write-Host "  $PackageName requiere instalacion manual" -ForegroundColor Yellow
+                    Write-Host "  El instalador esta en: $downloadPath" -ForegroundColor Yellow
+                    Write-Host "  ============================================" -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "  Presione Enter para continuar..." -ForegroundColor Yellow
+                    Read-Host | Out-Null
+                    $installSuccess = $true
+                }
+                else {
+                    Write-Log -Message "${PackageName}: no se pudo ejecutar el instalador" -Level Error
+                }
+            }
+            catch {
+                Write-Log -Message "Error al ejecutar instalador EXE: $_" -Level Error
+            }
+        }
+        elseif ($fileName -match '\.(msi|msix|msixbundle|appx)$') {
+            # MSI: instalar silencioso
+            try {
+                Write-Log -Message "Ejecutando instalador MSI: $fileName" -Level Info
+                $proc = Start-Process -FilePath 'msiexec' -ArgumentList "/i `"$downloadPath`" /passive /norestart" -Wait -PassThru -ErrorAction Stop
+                if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                    Write-Log -Message "$PackageName instalado correctamente (codigo: $($proc.ExitCode))" -Level Success
+                    $installSuccess = $true
+                }
+                else {
+                    Write-Log -Message "$PackageName MSI fallo con codigo: $($proc.ExitCode)" -Level Error
+                }
+            }
+            catch {
+                Write-Log -Message "Error al ejecutar instalador MSI: $_" -Level Error
+            }
+        }
+        elseif ($fileName -match '\.(img|iso)$') {
+            # IMG/ISO: montar y ejecutar setup
+            try {
+                Write-Log -Message "Montando imagen: $fileName" -Level Info
+                $mountResult = Mount-DiskImage -ImagePath $downloadPath -PassThru -ErrorAction Stop
+
+                $volume = $mountResult | Get-Volume -ErrorAction Stop
+                if (-not $volume -or -not $volume.DriveLetter) {
+                    throw "No se pudo obtener letra de unidad de la imagen montada"
+                }
+                $driveLetter = $volume.DriveLetter
+                Write-Log -Message "Imagen montada en unidad ${driveLetter}:" -Level Success
+
+                # Buscar setup.exe o instalador
+                $setupPath = "${driveLetter}:\setup.exe"
+                if (-not (Test-Path $setupPath)) {
+                    $setupPath = "${driveLetter}:\Setup.exe"
+                }
+                if (-not (Test-Path $setupPath)) {
+                    $setupFile = Get-ChildItem "${driveLetter}:\" -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($setupFile) { $setupPath = $setupFile.FullName }
+                }
+
+                if (Test-Path $setupPath) {
+                    Write-Log -Message "Ejecutando: $setupPath" -Level Info
+                    $proc = Start-Process -FilePath $setupPath -WorkingDirectory "${driveLetter}:\" -Wait -PassThru -ErrorAction Stop
+                    if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                        Write-Log -Message "$PackageName instalado correctamente (codigo: $($proc.ExitCode))" -Level Success
+                        $installSuccess = $true
+                        # Desmontar solo si la instalacion fue exitosa
+                        Write-Log -Message "Desmontando imagen..." -Level Info
+                        Dismount-DiskImage -ImagePath $downloadPath -ErrorAction SilentlyContinue
+                    }
+                    else {
+                        # Instalacion fallo: dejar imagen montada para instalacion manual
+                        Write-Log -Message "$PackageName no se pudo instalar automaticamente (codigo: $($proc.ExitCode))" -Level Warning
+                        Write-Host "" -ForegroundColor Yellow
+                        Write-Host "  ============================================" -ForegroundColor Yellow
+                        Write-Host "  $PackageName requiere instalacion manual" -ForegroundColor Yellow
+                        Write-Host "  La imagen esta montada en ${driveLetter}:\" -ForegroundColor Yellow
+                        Write-Host "  Ejecute setup.exe desde esa unidad" -ForegroundColor Yellow
+                        Write-Host "  ============================================" -ForegroundColor Yellow
+                        Write-Host ""
+                        Write-Host "  Presione Enter cuando termine la instalacion..." -ForegroundColor Yellow
+                        Read-Host | Out-Null
+                        $installSuccess = $true
+                        Dismount-DiskImage -ImagePath $downloadPath -ErrorAction SilentlyContinue
+                    }
+                }
+                else {
+                    # No hay setup.exe: dejar imagen montada
+                    Write-Log -Message "No se encontro setup.exe en la imagen" -Level Warning
+                    Start-Process "${driveLetter}:\"
+                    Write-Host "" -ForegroundColor Yellow
+                    Write-Host "  ============================================" -ForegroundColor Yellow
+                    Write-Host "  $PackageName requiere instalacion manual" -ForegroundColor Yellow
+                    Write-Host "  La imagen esta montada en ${driveLetter}:\" -ForegroundColor Yellow
+                    Write-Host "  Busque el instalador en esa unidad" -ForegroundColor Yellow
+                    Write-Host "  ============================================" -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "  Presione Enter cuando termine la instalacion..." -ForegroundColor Yellow
+                    Read-Host | Out-Null
+                    $installSuccess = $true
+                    Dismount-DiskImage -ImagePath $downloadPath -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-Log -Message "Error al montar/instalar imagen: $_" -Level Error
+                Dismount-DiskImage -ImagePath $downloadPath -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            Write-Log -Message "Tipo de archivo no reconocido: $fileName" -Level Warning
+        }
+
+        # Limpiar solo carpetas de extraccion temporal (no los instaladores)
+        $extractDir = Join-Path $tempDir 'extracted'
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+        Write-Log -Message "Instaladores guardados en: $downloadDir" -Level Info
+    }
+    catch {
+        Write-Log -Message "Error al descargar $PackageName`: $_" -Level Error
+    }
+
+    # Si la instalacion automatica fallo, abrir navegador como ultimo recurso
+    if (-not $installSuccess) {
+        Write-Log -Message "Instalacion automatica fallo. Abriendo navegador..." -Level Warning
+        try { Start-Process $ManualUrl } catch {}
+        Write-Host "  Instale $PackageName manualmente desde el navegador." -ForegroundColor Yellow
+        Write-Host "  Presione Enter cuando termine..." -ForegroundColor Yellow
+        Read-Host | Out-Null
+        return 'Failed'
+    }
+
+    return 'Success'
+}
+
+function Install-SoftwarePackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName,
+
+        [Parameter()]
+        [int]$MaxRetries = 3,
+
+        [Parameter()]
+        [int]$RetryDelay = 5,
+
+        [Parameter()]
+        [bool]$WingetUnavailable = $false,
+
+        [Parameter()]
+        [string]$ManualUrl = "",
+
+        [Parameter()]
+        [string]$ManualNote = "",
+
+        [Parameter()]
+        [string]$SilentArgs = ""
+    )
+
+    Write-Log -Message "Procesando: $PackageName ($PackageId)" -Level Info
+
+    # Verificar si ya esta instalado (ANTES de descargar nada)
+    if (Test-SoftwareInstalled -PackageId $PackageId -PackageName $PackageName) {
+        Write-Log -Message "$PackageName ya esta instalado - omitiendo" -Level Info
+        return 'Skipped'
+    }
+
+    # Si el paquete no esta en winget, usar descarga manual
+    if ($WingetUnavailable -and $ManualUrl) {
+        return Install-ManualPackage -PackageName $PackageName -ManualUrl $ManualUrl -ManualNote $ManualNote -SilentArgs $SilentArgs
+    }
+
+    # Obtener locale del sistema (ej: es-ES)
+    $systemLocale = (Get-Culture).Name
+    $useForce = $false
+
+    # Intentar instalar con reintentos
+    $attempt = 0
+    while ($attempt -lt $MaxRetries) {
+        $attempt++
+        Write-Log -Message "Instalando $PackageName (intento $attempt de $MaxRetries)..." -Level Info
+
+        try {
+            $wingetArgs = @(
+                'install', '--id', $PackageId,
+                '--accept-source-agreements',
+                '--accept-package-agreements',
+                '--silent',
+                '--source', 'winget',
+                '--locale', $systemLocale
+            )
+            if ($useForce) {
+                $wingetArgs += '--force'
+                Write-Log -Message "  Usando --force para forzar instalacion" -Level Info
+            }
+
+            $output = & winget @wingetArgs 2>&1
+
+            $exitCode = $LASTEXITCODE
+            $outputText = $output | Out-String
+
+            if ($exitCode -eq 0) {
+                Write-Log -Message "$PackageName instalado correctamente" -Level Success
+                return 'Success'
+            }
+
+            # Hash mismatch (-1978335215) o No applicable installer (-1978335216): reintentar con --force
+            if (($exitCode -eq -1978335215 -or $exitCode -eq -1978335216) -and -not $useForce) {
+                Write-Log -Message "Error $exitCode para $PackageName. Reintentando con --force..." -Level Warning
+                $useForce = $true
+                $attempt--  # No contar este intento
+                continue
+            }
+
+            # Codigo de salida distinto de 0 pero no excepcion
+            Write-Log -Message "winget retorno codigo $exitCode para $PackageName" -Level Warning
+        }
+        catch {
+            Write-Log -Message "Excepcion al instalar $PackageName`: $_" -Level Error
+        }
+
+        if ($attempt -lt $MaxRetries) {
+            Write-Log -Message "Reintentando en $RetryDelay segundos..." -Level Warning
+            Start-Sleep -Seconds $RetryDelay
+        }
+    }
+
+    # Fallback: si winget fallo y hay URL manual, intentar descarga directa
+    if ($ManualUrl) {
+        Write-Log -Message "winget fallo para $PackageName. Intentando descarga directa..." -Level Warning
+        $manualResult = Install-ManualPackage -PackageName $PackageName -ManualUrl $ManualUrl -ManualNote $ManualNote -SilentArgs $SilentArgs
+        return $manualResult
+    }
+
+    Write-Log -Message "No se pudo instalar $PackageName despues de $MaxRetries intentos" -Level Error
+    return 'Failed'
+}
+
+function Install-SoftwareList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Packages,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CategoryName
+    )
+
+    $results = @{
+        Success = @()
+        Failed  = @()
+        Skipped = @()
+    }
+
+    $total = $Packages.Count
+    Write-Log -Message "Iniciando instalacion de $total paquetes en '$CategoryName'" -Level Info
+
+    for ($i = 0; $i -lt $total; $i++) {
+        $pkg = $Packages[$i]
+        $current = $i + 1
+
+        Show-Progress -Current $current -Total $total -Activity "Instalando $CategoryName" -Status $pkg.name
+
+        $installParams = @{
+            PackageId   = $pkg.id
+            PackageName = $pkg.name
+        }
+        if ($pkg.wingetUnavailable -eq $true) {
+            $installParams.WingetUnavailable = $true
+        }
+        # Pasar ManualUrl siempre (sirve como fallback si winget falla)
+        if ($pkg.manualUrl) {
+            $installParams.ManualUrl = $pkg.manualUrl
+            $installParams.ManualNote = if ($pkg.manualNote) { $pkg.manualNote } else { "" }
+        }
+        if ($pkg.silentArgs) {
+            $installParams.SilentArgs = $pkg.silentArgs
+        }
+        $status = Install-SoftwarePackage @installParams
+
+        switch ($status) {
+            'Success' { $results.Success += $pkg.name }
+            'Failed'  { $results.Failed += $pkg.name }
+            'Skipped' { $results.Skipped += $pkg.name }
+        }
+    }
+
+    Write-Log -Message "Categoria '$CategoryName' completada: $($results.Success.Count) instalados, $($results.Failed.Count) fallidos, $($results.Skipped.Count) omitidos" -Level Info
+    return $results
+}
+
+function Start-SoftwareInstallation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    $catalog = Get-SoftwareCatalog -ConfigPath $ConfigPath
+    if (-not $catalog) {
+        Write-Log -Message "No se pudo cargar el catalogo de software" -Level Error
+        return
+    }
+
+    $allResults = @{
+        Success = @()
+        Failed  = @()
+        Skipped = @()
+    }
+
+    $continueLoop = $true
+    while ($continueLoop) {
+        # Preparar opciones de categorias
+        $categoryNames = @()
+        $categoryDescriptions = @()
+        foreach ($cat in $catalog.categories) {
+            $categoryNames += $cat.name
+            $categoryDescriptions += "$($cat.name) - $($cat.description) ($($cat.packages.Count) paquetes)"
+        }
+
+        Write-Section -Title "Instalacion de Software"
+        $selectedCategory = Show-CategoryMenu -Categories $categoryDescriptions -Title "Seleccione una categoria"
+
+        if ($null -eq $selectedCategory -or $selectedCategory -lt 0) {
+            $continueLoop = $false
+            continue
+        }
+
+        $category = $catalog.categories[$selectedCategory]
+        Write-Log -Message "Categoria seleccionada: $($category.name)" -Level Info
+
+        # Preparar lista de paquetes para checkboxes
+        $packageItems = @()
+        $preSelected = @()
+        for ($i = 0; $i -lt $category.packages.Count; $i++) {
+            $pkg = $category.packages[$i]
+            $packageItems += "$($pkg.name) - $($pkg.description)"
+            if ($pkg.recommended) {
+                $preSelected += $i
+            }
+        }
+
+        $selectedIndexes = Show-CheckboxList -Items $packageItems -Title "Paquetes en '$($category.name)'" -PreSelected $preSelected
+
+        if (-not $selectedIndexes -or $selectedIndexes.Count -eq 0) {
+            Write-Log -Message "No se seleccionaron paquetes en '$($category.name)'" -Level Info
+            continue
+        }
+
+        # Construir lista de paquetes seleccionados
+        $selectedPackages = @()
+        foreach ($idx in $selectedIndexes) {
+            $selectedPackages += $category.packages[$idx]
+        }
+
+        Write-Log -Message "Se seleccionaron $($selectedPackages.Count) paquetes para instalar" -Level Info
+
+        $confirm = Show-Confirmation -Message "Instalar $($selectedPackages.Count) paquetes de '$($category.name)'?"
+        if (-not $confirm) {
+            Write-Log -Message "Instalacion cancelada por el usuario" -Level Warning
+            continue
+        }
+
+        # Instalar paquetes seleccionados
+        $categoryResults = Install-SoftwareList -Packages $selectedPackages -CategoryName $category.name
+
+        # Acumular resultados globales
+        $allResults.Success += $categoryResults.Success
+        $allResults.Failed += $categoryResults.Failed
+        $allResults.Skipped += $categoryResults.Skipped
+
+        # Mostrar resumen parcial
+        Show-Summary -Results $categoryResults -Title "Resumen: $($category.name)"
+
+        # Preguntar si continuar con otra categoria
+        $continueLoop = Show-Confirmation -Message "Desea instalar software de otra categoria?"
+    }
+
+    # Mostrar resumen global si hubo instalaciones
+    if (($allResults.Success.Count + $allResults.Failed.Count + $allResults.Skipped.Count) -gt 0) {
+        Show-Summary -Results $allResults -Title "Resumen General de Instalacion"
+    }
+
+    Write-Log -Message "Proceso de instalacion de software finalizado" -Level Info
+}
+
+function Install-RecommendedSoftware {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    $catalog = Get-SoftwareCatalog -ConfigPath $ConfigPath
+    if (-not $catalog) {
+        Write-Log -Message "No se pudo cargar el catalogo de software" -Level Error
+        return $null
+    }
+
+    # Recopilar todos los paquetes recomendados
+    $recommendedPackages = @()
+    foreach ($cat in $catalog.categories) {
+        foreach ($pkg in $cat.packages) {
+            if ($pkg.recommended -eq $true) {
+                $recommendedPackages += $pkg
+            }
+        }
+    }
+
+    if ($recommendedPackages.Count -eq 0) {
+        Write-Log -Message "No se encontraron paquetes recomendados en el catalogo" -Level Warning
+        return @{ Success = @(); Failed = @(); Skipped = @() }
+    }
+
+    Write-Log -Message "Instalando $($recommendedPackages.Count) paquetes recomendados..." -Level Info
+
+    $results = Install-SoftwareList -Packages $recommendedPackages -CategoryName "Recomendados"
+
+    Show-Summary -Results $results -Title "Resumen: Software Recomendado"
+
+    return $results
+}
+
+Export-ModuleMember -Function @(
+    'Get-SoftwareCatalog',
+    'Test-SoftwareInstalled',
+    'Install-ManualPackage',
+    'Install-SoftwarePackage',
+    'Install-SoftwareList',
+    'Start-SoftwareInstallation',
+    'Install-RecommendedSoftware'
+)
