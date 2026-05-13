@@ -82,19 +82,15 @@ else {
     Write-Host "  Creando usuario '$NombreUsuario'..." -ForegroundColor White
 
     try {
-        New-LocalUser -Name $NombreUsuario -NoPassword -FullName $NombreUsuario -Description "Cuenta para examenes" -UserMayNotChangePassword -ErrorAction Stop
-        Write-Host "  [OK] Usuario creado (sin password)" -ForegroundColor Green
+        net user $NombreUsuario /add /fullname:"$NombreUsuario" /comment:"Cuenta para examenes" /passwordchg:no /active:yes 2>$null | Out-Null
+        wmic useraccount where "name='$NombreUsuario'" set PasswordExpires=FALSE 2>$null | Out-Null
+        Write-Host "  [OK] Usuario creado (sin password, sin prompt)" -ForegroundColor Green
 
-        # Anadir a administradores (intentar en espanol y en ingles)
-        try {
-            Add-LocalGroupMember -Group "Administradores" -Member $NombreUsuario -ErrorAction Stop
-            Write-Host "  [OK] Anadido al grupo Administradores" -ForegroundColor Green
+        net localgroup Administradores $NombreUsuario /add 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            net localgroup Administrators $NombreUsuario /add 2>$null
         }
-        catch {
-            Add-LocalGroupMember -Group "Administrators" -Member $NombreUsuario -ErrorAction Stop
-            Write-Host "  [OK] Anadido al grupo Administrators" -ForegroundColor Green
-        }
-
+        Write-Host "  [OK] Anadido al grupo Administradores" -ForegroundColor Green
     }
     catch {
         Write-Host "  [!!] Error creando usuario: $_" -ForegroundColor Red
