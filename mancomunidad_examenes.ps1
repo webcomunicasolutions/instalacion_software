@@ -121,8 +121,23 @@ if (-not $tieneWinget) {
 }
 
 if ($tieneWinget) {
-    # Verificar si ya esta instalado
-    $loInstalled = winget list --id TheDocumentFoundation.LibreOffice 2>$null | Select-String "TheDocumentFoundation"
+    # Verificar si ya esta instalado (winget O en disco)
+    $loInstalled = $false
+    $loWinget = winget list --id TheDocumentFoundation.LibreOffice 2>$null | Select-String "TheDocumentFoundation"
+    if ($loWinget) { $loInstalled = $true }
+
+    # Buscar tambien en disco (instalacion manual)
+    if (-not $loInstalled) {
+        $loPaths = @(
+            "${env:ProgramFiles}\LibreOffice",
+            "${env:ProgramFiles(x86)}\LibreOffice",
+            "C:\Program Files\LibreOffice",
+            "C:\Program Files (x86)\LibreOffice"
+        )
+        foreach ($p in $loPaths) {
+            if (Test-Path $p) { $loInstalled = $true; break }
+        }
+    }
 
     if ($loInstalled) {
         Write-Host "  [OK] LibreOffice ya esta instalado - omitiendo" -ForegroundColor Green
