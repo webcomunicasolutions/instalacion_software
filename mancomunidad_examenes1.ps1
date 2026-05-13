@@ -234,19 +234,10 @@ if (Test-Path $defaultHive) {
     reg unload "HKU\DefaultUser" 2>$null
 }
 
-# Menu contextual clasico (necesita crear clave especial)
+# Menu contextual clasico (necesita crear clave especial via reg.exe)
 foreach ($profile in $profileList) {
-    if (-not (Get-PSDrive HKU -ErrorAction SilentlyContinue)) {
-        New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS | Out-Null
-    }
-    $clsidPath = "HKU:\$($profile.SID)\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-    try {
-        if (-not (Test-Path $clsidPath)) {
-            New-Item -Path $clsidPath -Force | Out-Null
-        }
-        Set-ItemProperty -Path $clsidPath -Name "(Default)" -Value "" -Force
-    }
-    catch { }
+    $sid = $profile.SID
+    reg add "HKU\$sid\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /ve /d "" /f 2>$null | Out-Null
 }
 Write-Host "  [OK] Menu contextual clasico activado" -ForegroundColor Green
 
